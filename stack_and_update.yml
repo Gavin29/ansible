@@ -11,7 +11,7 @@
     timeout_minutes: 60
     wait_minutes: 5
     vsf_wait_minutes: 10  # Time to wait for VSF stacking to complete
-
+    
   tasks:
     # Step 0: Check for VSF partners and start auto-stacking if needed
     - name: Step 0a - Check for VSF partner switches
@@ -20,22 +20,22 @@
       register: vsf_status
       delegate_to: localhost
       ignore_errors: yes
-
+      
     - name: Show current VSF status
       debug:
         var: vsf_status.stdout_lines
       when: vsf_status.rc == 0
-
+        
     - name: Check if VSF partners are detected
       set_fact:
         has_vsf_partners: "{{ 'Partner' in vsf_status.stdout or 'partner' in vsf_status.stdout or 'Fragment' in vsf_status.stdout }}"
       when: vsf_status.rc == 0
-
+      
     - name: Set VSF partners flag to false if command failed
       set_fact:
         has_vsf_partners: false
       when: vsf_status.rc != 0
-
+        
     - name: VSF partner detection result
       debug:
         msg: |
@@ -44,7 +44,7 @@
           {% else %}
           ℹ️  No VSF partners detected - skipping auto-stacking
           {% endif %}
-
+    
     - name: Step 0b - Start VSF auto-stacking (only if partners detected)
       shell: |
         timeout 30 bash -c 'echo -e "vsf start-auto-stacking\ny\nexit" | sshpass -p "{{ ansible_password }}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ ansible_user }}@{{ ansible_host }}'
@@ -52,18 +52,162 @@
       delegate_to: localhost
       ignore_errors: yes
       when: has_vsf_partners | default(false)
-
+      
     - name: Show VSF auto-stacking command result
       debug:
         var: vsf_start_result.stdout_lines
       when: has_vsf_partners | default(false) and vsf_start_result is defined
-
+        
     - name: Wait for VSF stacking to complete
       debug:
         msg: "⏳ Waiting {{ vsf_wait_minutes }} minutes for VSF auto-stacking to complete..."
       when: has_vsf_partners | default(false)
-
+        
     - name: Sleep for VSF completion
       pause:
         minutes: "{{ vsf_wait_minutes }}"
-"stack_and_update.yml" 213L, 8511B                                                                                                                                                                                                                        1,1           Top
+      when: has_vsf_partners | default(false)
+    
+    - name: Step 0c - Verify VSF stack status after auto-stacking
+      shell: |
+        timeout 15 sshpass -p "{{ ansible_password }}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ ansible_user }}@{{ ansible_host }} "show vsf"
+      register: vsf_final_status
+      delegate_to: localhost
+      ignore_errors: yes
+      when: has_vsf_partners | default(false)
+      
+    - name: Show final VSF stack status
+      debug:
+        var: vsf_final_status.stdout_lines
+      when: has_vsf_partners | default(false) and vsf_final_status.rc == 0
+        
+    - name: VSF stacking completion status
+      debug:
+        msg: |
+          {% if has_vsf_partners | default(false) %}
+          ✅ VSF auto-stacking process completed - proceeding with firmware update
+          {% else %}
+          ℹ️  No VSF stacking required - proceeding with firmware update
+          {% endif %}
+
+    # Step 1: Enable allow-unsafe-updates using SSH (since httpapi doesn't work for this)
+    - name: Step 1 - Enable allow-unsafe-updates via SSH
+      shell: |
+        timeout 30 bash -c 'echo -e "configure\nallow-unsafe-updates {{ timeout_minutes }}\ny\nend\nexit" | sshpass -p "{{ ansible_password }}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ ansible_user }}@{{ ansible_host }}'
+      register: unsafe_updates_result
+      delegate_to: localhost
+      ignore_errors: yes
+      
+    - name: Show unsafe updates result
+      debug:
+        var: unsafe_updates_result.stdout_lines
+        
+    - name: Confirm unsafe updates enabled
+      debug:
+        msg: "✅ allow-unsafe-updates is now enabled for {{ timeout_minutes }} minutes"
+      when: "'allowed' in unsafe_updates_result.stdout"
+      
+    - name: Warning if unsafe updates failed
+      debug:
+        msg: "⚠️  WARNING: allow-unsafe-updates may not be enabled. Continuing with firmware upload..."
+      when: "'allowed' not in unsafe_updates_result.stdout"
+    
+    # Step 2: Upload firmware to primary partition
+    - name: Step 2 - Upload firmware to primary partition
+      arubanetworks.aoscx.aoscx_upload_firmware:
+        remote_firmware_file_path: http://10.10.64.3/CCDS/switches_fw/ArubaOS-CX_6400-6300_10_13_1031.swi
+        partition_name: primary
+        vrf: mgmt
+        wait_firmware_upload: true
+      register: primary_results
+      
+    - name: Show primary upload result
+      debug:
+        var: primary_results
+        
+    - name: Confirm primary upload
+      debug:
+        msg: "✅ Primary partition firmware upload completed"
+      when: primary_results is succeeded
+    
+    # Step 3: Upload firmware to secondary partition
+    - name: Step 3 - Upload firmware to secondary partition
+      arubanetworks.aoscx.aoscx_upload_firmware:
+        remote_firmware_file_path: http://10.10.64.3/CCDS/switches_fw/ArubaOS-CX_6400-6300_10_13_1031.swi
+        partition_name: secondary
+        vrf: mgmt
+        wait_firmware_upload: true
+      register: secondary_results
+      
+    - name: Show secondary upload result
+      debug:
+        var: secondary_results
+        
+    - name: Confirm secondary upload
+      debug:
+        msg: "✅ Secondary partition firmware upload completed"
+      when: secondary_results is succeeded
+    
+    # Step 4: Wait for modules to reach ready state
+    - name: Step 4 - Wait {{ wait_minutes }} minutes for modules to reach ready state
+      debug:
+        msg: "⏳ Waiting {{ wait_minutes }} minutes for all line and fabric modules to reach ready state before rebooting..."
+        
+    - name: Sleep for {{ wait_minutes }} minutes
+      pause:
+        minutes: "{{ wait_minutes }}"
+    
+    # Step 5: Check module status before reboot
+    - name: Step 5 - Check module status before reboot
+      shell: |
+        timeout 15 sshpass -p "{{ ansible_password }}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ ansible_user }}@{{ ansible_host }} "show module"
+      register: module_status
+      ignore_errors: yes
+      delegate_to: localhost
+      
+    - name: Show module status
+      debug:
+        var: module_status.stdout_lines
+      when: module_status.rc == 0
+    
+    # Step 6: Reboot the switch
+    - name: Step 6 - Reboot switch with boot system command
+      shell: |
+        timeout 30 bash -c 'echo -e "boot system\ny\n" | sshpass -p "{{ ansible_password }}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ ansible_user }}@{{ ansible_host }}'
+      register: reboot_result
+      delegate_to: localhost
+      ignore_errors: yes  # SSH connection will be terminated when switch reboots
+      
+    - name: Show reboot command output
+      debug:
+        var: reboot_result.stdout_lines
+      when: reboot_result.stdout_lines is defined
+      
+    - name: Confirm reboot initiated
+      debug:
+        msg: |
+          🔄 FIRMWARE UPDATE AND REBOOT COMPLETED!
+          
+          {% if reboot_result.rc != 0 %}
+          ✅ SSH connection terminated (expected) - switch is rebooting
+          {% else %}
+          ⚠️  SSH connection didn't terminate - reboot may not have started
+          {% endif %}
+          
+          Summary of actions completed:
+          {% if has_vsf_partners | default(false) %}
+          - VSF auto-stacking initiated and completed
+          {% endif %}
+          - Unsafe updates enabled for {{ timeout_minutes }} minutes
+          - Primary partition firmware uploaded: {{ 'SUCCESS' if primary_results is succeeded else 'FAILED' }}
+          - Secondary partition firmware uploaded: {{ 'SUCCESS' if secondary_results is succeeded else 'FAILED' }}
+    
+    # Step 7: Final status
+    - name: Final status
+      debug:
+        msg: |
+          🔄 FIRMWARE UPDATE IN PROGRESS
+          {% if has_vsf_partners | default(false) %}
+          
+          VSF stacking was completed before firmware update to ensure stack stability.
+          {% endif %}
