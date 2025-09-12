@@ -1,0 +1,60 @@
+              -o ControlMaster=no \
+              {{ _ssh_user }}@{{ _ssh_host }}'
+      register: unsafe_updates_result
+      ignore_errors: true
+      changed_when: true
+      delegate_to: localhost
+
+    - name: pre-boot | show allow-unsafe-updates output
+      debug:
+        var: unsafe_updates_result.stdout_lines
+
+    - name: pre-boot | wait {{ wait_before_reboot }} seconds before reboot
+      pause:
+        seconds: "{{ wait_before_reboot }}"
+
+    ########################################################################
+    # Reboot (boot system) + wait for SSH down/up
+    ########################################################################
+    - name: reboot | initiate with 'boot system'
+      shell: |
+        timeout 90 bash -lc '
+          printf "boot system\ny\ny\n" |
+          sshpass -p "{{ _ssh_pass }}" ssh -tt \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=2 \
+            -o ServerAliveCountMax=2 \
+            -o ControlMaster=no \
+            {{ _ssh_user }}@{{ _ssh_host }}'
+      register: reboot_result
+      delegate_to: localhost
+      ignore_errors: true
+      changed_when: true
+
+    - name: reboot | wait for SSH to go down
+      wait_for:
+        host: "{{ _ssh_host }}"
+        port: 22
+        state: stopped
+        timeout: "{{ reboot_down_timeout }}"
+      delegate_to: localhost
+      ignore_errors: true   # in case SSH drops too fast to catch
+
+    - name: reboot | wait for SSH to return
+      wait_for:
+        host: "{{ _ssh_host }}"
+        port: 22
+        state: started
+        delay: 30
+        timeout: "{{ reboot_up_timeout }}"
+      delegate_to: localhost
+
+    - name: reboot | post-up settle
+      pause:
+        seconds: "{{ post_up_settle }}"
+
+    ########################################################################
+    # Post-verify (informational)
+-- INSERT --                                                                                                                                                                          197,15        73%
